@@ -8,9 +8,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from contextlib import asynccontextmanager
 from sqlalchemy import text
-from db import init_db
+from src.db import init_db
 
-from routers import countries_router, status_router
+from src.routers import countries_router, status_router
 
 
 @asynccontextmanager
