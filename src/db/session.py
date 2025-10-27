@@ -7,8 +7,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-DATABASE_URL = os.getenv("DATABASE_URL")
-
+DATABASE_URL = os.getenv("DB_URL", "sqlite:///./countries.db")
 db_name = DATABASE_URL.rsplit("/", 1)[-1]
 
 root_engine = create_engine(
