@@ -1,114 +1,80 @@
-from fastapi import FastAPI, HTTPException, Depends, Query
-from fastapi.responses import JSONResponse, FileResponse
-from fastapi.requests import Request
-from fastapi.exceptions import RequestValidationError
-from starlette.exceptions import HTTPException as StarletteHTTPException
+# app/main.py
+from fastapi import FastAPI, HTTPException, Depends, Query, Response
+from fastapi.responses import FileResponse, JSONResponse
 from sqlalchemy.orm import Session
-from app.database import get_db, Base, engine
-from app import models, services, crud, schemas
-from app.image_generator import generate_summary_image
-from datetime import datetime
-from typing import Optional, List
+from datetime import datetime, timezone
 import os
-import uvicorn
 
-Base.metadata.create_all(bind=engine)
+from app import database, crud, utils, models
+from app.schemas import CountryOut, CountryBase, StatusOut
 
-app = FastAPI(title="Country Currency Exchange API")
+# initialize DB
+models.Base.metadata.create_all(bind=database.engine)
 
-@app.exception_handler(StarletteHTTPException)
-async def http_exception_handler(request: Request, exc: StarletteHTTPException):
-    if exc.status_code == 404:
-        return JSONResponse(status_code=404, content={"error": "Country not found"})
-    return JSONResponse(status_code=exc.status_code, content={"error": exc.detail})
+app = FastAPI(title="Country Currency & Exchange API")
 
-@app.exception_handler(RequestValidationError)
-async def validation_exception_handler(request: Request, exc: RequestValidationError):
-    return JSONResponse(
-        status_code=400,
-        content={"error": "Validation failed", "details": exc.errors()}
-    )
+CACHE_IMAGE_PATH = os.path.join("cache", "summary.png")
 
-@app.get("/")
-def read_root():
-    return {
-        "message": [
-            "Welcome to the Country Currency Exchange API.",
-            "Visit /status for overview.",
-            "Visit /docs for endpoints."
-        ]
-    }
+def get_db():
+    yield from database.get_db()
 
-@app.get("/status")
-def get_status(db: Session = Depends(get_db)):
-    total = db.query(models.Country).count()
-    last_country = db.query(models.Country).order_by(models.Country.last_refreshed_at.desc()).first()
-    return {
-        "total_countries": total,
-        "last_refreshed_at": last_country.last_refreshed_at if last_country else None
-    }
-
+# POST /countries/refresh → Fetch all countries and exchange rates, then cache them in the database
 @app.post("/countries/refresh")
 def refresh_countries(db: Session = Depends(get_db)):
-    countries_data, err1 = services.fetch_countries()
-    rates, err2 = services.fetch_exchange_rates()
+    try:
+        countries_raw = utils.fetch_countries()
+    except Exception as e:
+        raise HTTPException(status_code=503, detail={"error": "External data source unavailable", "details": "Could not fetch data from restcountries.com"})
 
-    # Handle errors or missing data from external APIs
-    if err1 or countries_data is None:
-        raise HTTPException(
-            status_code=503,
-            detail={
-                "error": "External data source unavailable",
-                "details": "Could not fetch data from RestCountries API"
-            }
-        )
+    try:
+        rates = utils.fetch_exchange_rates()
+    except Exception as e:
+        raise HTTPException(status_code=503, detail={"error": "External data source unavailable", "details": "Could not fetch data from open.er-api.com"})
 
-    if err2 or rates is None:
-        raise HTTPException(
-            status_code=503,
-            detail={
-                "error": "External data source unavailable",
-                "details": "Could not fetch data from Exchange Rate API"
-            }
-        )
+    # We'll perform in-memory processing first; if anything fails, don't commit partial updates
+    import tempfile
+    from datetime import datetime
+    now = datetime.now(timezone.utc)
 
-    total = 0
-    timestamp = datetime.utcnow()
-
-    for c in countries_data or []:  # <- ✅ protects against None
-        name = c.get("name")
-        capital = c.get("capital")
-        region = c.get("region")
-        population = c.get("population") or 0
-        flag = c.get("flag")
-
-        currencies = c.get("currencies", [])
-        currency_code = None
-        exchange_rate = None
-        estimated_gdp = 0
-
-        if not name:
+    processed = []
+    for entry in countries_raw:
+        name = entry.get("name")
+        population = entry.get("population")
+        if name is None or population is None:
+            # skip invalid country data
             continue
-        
-        if currencies and isinstance(currencies, list) and len(currencies) > 0:
-            currency_code = currencies[0].get("code")
-            if not currency_code:
-                raise HTTPException(
-                    status_code=400,
-                    detail={"error": "Validation failed", "details": {"currency_code": "is required"}}
-                )
-            if currency_code in rates:
-                exchange_rate = rates[currency_code]
-                estimated_gdp = services.compute_gdp(population, exchange_rate)
+
+        capital = entry.get("capital")
+        region = entry.get("region")
+        flag_url = entry.get("flag")
+
+        currencies = entry.get("currencies") or []
+        if not currencies:
+            # per spec: store with currency_code null, exchange_rate null, estimated_gdp 0
+            currency_code = None
+            exchange_rate = None
+            estimated_gdp = 0.0
+        else:
+            # currency is first element's code if exists
+            first = currencies[0]
+            currency_code = first.get("code") if isinstance(first, dict) else None
+            exchange_rate = None
+            estimated_gdp = None
+            if currency_code:
+                # match currency_code to rates (rates keyed by currency code)
+                rate = rates.get(currency_code)
+                if rate is None:
+                    # currency not found in rates per spec => set exchange_rate-null and estimated_gdp-null
+                    exchange_rate = None
+                    estimated_gdp = None
+                else:
+                    exchange_rate = float(rate)
+                    estimated_gdp = utils.compute_estimated_gdp(population, exchange_rate)
             else:
                 exchange_rate = None
                 estimated_gdp = None
-        else:
-            currency_code = None
-            exchange_rate = None
-            estimated_gdp = 0
 
-        country_record = {
+        processed.append({
             "name": name,
             "capital": capital,
             "region": region,
@@ -116,53 +82,60 @@ def refresh_countries(db: Session = Depends(get_db)):
             "currency_code": currency_code,
             "exchange_rate": exchange_rate,
             "estimated_gdp": estimated_gdp,
-            "flag_url": flag,
-            "last_refreshed_at": timestamp
-        }
+            "flag_url": flag_url
+        })
 
-        crud.upsert_country(db, country_record)
-        total += 1
+    # Now persist/upsert all entries atomically-ish: we'll upsert each row (commit per row)
+    # If you want strict rollback on failure, use transaction — simpler approach here: commit per upsert
+    for item in processed:
+        crud.upsert_country(db, item, now)
 
-    # Generate summary image
-    top5 = db.query(models.Country).order_by(models.Country.estimated_gdp.desc()).limit(5).all()
-    generate_summary_image(total, top5, timestamp.strftime("%Y-%m-%d %H:%M:%S"))
+    # generate summary image
+    utils.generate_summary_image(db, CACHE_IMAGE_PATH, now)
 
-    return {
-        "message": "Countries refreshed successfully",
-        "total_updated": total,
-        "last_refreshed_at": timestamp.strftime("%Y-%m-%d %H:%M:%S")
-    }
+    return {"status": "success", "total_countries": len(processed), "last_refreshed_at": now.isoformat()}
 
-@app.get("/countries/image")
-def get_summary_image():
-    path = os.path.join("cache", "summary.png")
-    if not os.path.exists(path):
-        return JSONResponse(status_code=404, content={"error": "Summary image not found"})
-    return FileResponse(path, media_type="image/png")
-
-@app.get("/countries", response_model=List[schemas.CountryResponse])
-def list_countries(
-    region: Optional[str] = Query(None),
-    currency: Optional[str] = Query(None),
-    sort: Optional[str] = Query(None),
+# GET /countries
+@app.get("/countries", response_model=list[CountryOut])
+def get_countries(
+    region: str | None = Query(None),
+    currency: str | None = Query(None),
+    sort: str | None = Query(None, description="gdp_desc or gdp_asc"),
     db: Session = Depends(get_db)
 ):
-    countries = crud.get_all_countries(db, region, currency, sort)
-    return countries
+    # validate query values
+    if sort and sort not in ("gdp_desc", "gdp_asc"):
+        raise HTTPException(status_code=400, detail={"error": "Validation failed", "details": {"sort": "invalid sort value"}})
+    records = crud.list_countries(db, region=region, currency=currency, sort=sort)
+    return records
 
-@app.get("/countries/{name}", response_model=schemas.CountryResponse)
+# GET /countries/:name
+@app.get("/countries/{name}", response_model=CountryOut)
 def get_country(name: str, db: Session = Depends(get_db)):
-    country = crud.get_country_by_name(db, name)
-    if not country:
-        raise HTTPException(status_code=404, detail="Country not found")
-    return country
+    rec = crud.get_country_by_name(db, name)
+    if not rec:
+        raise HTTPException(status_code=404, detail={"error": "Country not found"})
+    return rec
 
-@app.delete("/countries/{name}")
+# DELETE /countries/:name
+@app.delete("/countries/{name}", status_code=204)
 def delete_country(name: str, db: Session = Depends(get_db)):
-    deleted = crud.delete_country(db, name)
-    if not deleted:
-        raise HTTPException(status_code=404, detail="Country not found")
-    return {"message": f"{name} deleted successfully"}
+    ok = crud.delete_country(db, name)
+    if not ok:
+        raise HTTPException(status_code=404, detail={"error": "Country not found"})
+    return Response(status_code=204)
 
-if __name__ == "__main__":
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+# GET /status
+@app.get("/status", response_model=StatusOut)
+def status(db: Session = Depends(get_db)):
+    total = db.query(models.Country).count()
+    last = db.query(models.Country).order_by(models.Country.last_refreshed_at.desc()).first()
+    last_time = last.last_refreshed_at if last else None
+    return {"total_countries": total, "last_refreshed_at": last_time}
+
+# GET /countries/image
+@app.get("/countries/image")
+def serve_image():
+    if not os.path.exists(CACHE_IMAGE_PATH):
+        return JSONResponse(status_code=404, content={"error": "Summary image not found"})
+    return FileResponse(CACHE_IMAGE_PATH, media_type="image/png")

@@ -1,17 +1,17 @@
-from sqlalchemy import Column, Integer, String, Float, BigInteger, DateTime
-from sqlalchemy.sql import func
-from .database import Base
+# app/models.py
+from sqlalchemy import Column, Integer, String, Float, DateTime, func
+from sqlalchemy.dialects.mysql import VARCHAR
+from app.database import Base
 
 class Country(Base):
     __tablename__ = "countries"
-
-    id = Column(Integer, primary_key=True, index=True)
-    name = Column(String(255), unique=True, nullable=False)
-    capital = Column(String(255))
-    region = Column(String(255))
-    population = Column(BigInteger, nullable=False)
-    currency_code = Column(String(10))
-    exchange_rate = Column(Float)
-    estimated_gdp = Column(Float)
-    flag_url = Column(String(512))
-    last_refreshed_at = Column(DateTime, nullable=False, default=func.now())
+    id = Column(Integer, primary_key=True, index=True, autoincrement=True)
+    name = Column(VARCHAR(255), unique=True, nullable=False)
+    capital = Column(VARCHAR(255), nullable=True)
+    region = Column(VARCHAR(100), nullable=True)
+    population = Column(Integer, nullable=False)
+    currency_code = Column(VARCHAR(10), nullable=True)
+    exchange_rate = Column(Float, nullable=True)
+    estimated_gdp = Column(Float, nullable=True)
+    flag_url = Column(VARCHAR(512), nullable=True)
+    last_refreshed_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
