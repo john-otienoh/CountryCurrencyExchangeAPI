@@ -1,11 +1,7 @@
-fastapi==0.115.0
-uvicorn==0.30.0
-sqlalchemy==2.0.43
-cryptography
-psycopg[binary]==3.2.3
-httpx
-Pillow
-pymysql
-pydantic==2.8.2
+fastapi[all]==0.115.0
+uvicorn==0.30.1
+sqlalchemy==2.0.34
+requests==2.32.3
 python-dotenv==1.0.1
-alembic==1.11.1
+pillow==10.2.0
+
